@@ -257,217 +257,82 @@ class DiceSearchStrategy:
 def _parse_nextjs_jobs(html: str) -> List[Dict]:
     """Extract job objects from Dice.com Next.js RSC payloads.
 
-    Dice embeds data in ``<script>`` tags containing
-    ``self.__next_f.push([1, "..."])`` calls.  The second element of the
-    array is a (possibly very long) string that may contain serialised JSON
-    with the job listing data.
+    Dice embeds job data inside ``self.__next_f.push([1, "..."])`` script
+    calls.  The second element is a long string with escaped quotes (``\\"``)
+    containing the RSC tree, which includes a ``"jobList":{"data":[...]}``
+    JSON array of job objects.
 
     Strategy:
-    1. Find all ``self.__next_f.push(...)`` script contents.
-    2. Extract the string payload from each push call.
-    3. Look for JSON objects that contain job-like fields.
-    4. Return the list of raw job dicts.
+    1. Find every ``self.__next_f.push([1,"..."])`` payload.
+    2. Unescape the inner string (``\\"`` → ``"``).
+    3. Locate ``"jobList":{"data":[`` and extract the JSON array.
+    4. Parse each job object from the array.
     """
     jobs: List[Dict] = []
 
-    # Pattern to match self.__next_f.push([...]) payloads
-    push_pattern = re.compile(r'self\.__next_f\.push\(\s*\[.*?\]\s*\)', re.DOTALL)
+    # Match push payloads that contain job data
+    push_pattern = re.compile(
+        r'self\.__next_f\.push\(\s*\[1,"(.*?)"\]\s*\)', re.DOTALL
+    )
 
-    # Find all script tag contents
-    script_pattern = re.compile(r'<script[^>]*>(.*?)</script>', re.DOTALL)
+    for match in push_pattern.finditer(html):
+        raw_str = match.group(1)
 
-    for script_match in script_pattern.finditer(html):
-        script_content = script_match.group(1)
-
-        if 'self.__next_f.push' not in script_content:
+        # Only process payloads that actually contain job data
+        if 'companyName' not in raw_str:
             continue
 
-        # Try to find JSON objects with job data embedded in the script
-        # Dice embeds job data as JSON within the RSC payload strings
-        # Look for arrays of objects containing typical job fields
-        _extract_jobs_from_text(script_content, jobs)
+        # Unescape the JS string: \" → "
+        unescaped = raw_str.replace('\\"', '"')
 
-    # Fallback: try to find job data in JSON-LD or other structured data
-    if not jobs:
-        _extract_jobs_from_json_ld(html, jobs)
+        # Find the jobList.data array
+        marker = '"jobList":{"data":['
+        jl_idx = unescaped.find(marker)
+        if jl_idx < 0:
+            continue
 
-    # Fallback: try to find job data in window.__NEXT_DATA__
-    if not jobs:
-        _extract_jobs_from_next_data(html, jobs)
+        arr_start = jl_idx + len(marker) - 1  # position of '['
+
+        # Find the matching closing ']' using bracket depth tracking
+        depth = 0
+        arr_end = arr_start
+        for ci in range(arr_start, len(unescaped)):
+            ch = unescaped[ci]
+            if ch == '[':
+                depth += 1
+            elif ch == ']':
+                depth -= 1
+                if depth == 0:
+                    arr_end = ci + 1
+                    break
+
+        arr_str = unescaped[arr_start:arr_end]
+
+        try:
+            parsed_jobs = json.loads(arr_str)
+            if isinstance(parsed_jobs, list):
+                jobs.extend(parsed_jobs)
+        except json.JSONDecodeError:
+            # If full array parse fails, try extracting individual objects
+            _extract_individual_jobs(arr_str, jobs)
 
     return jobs
 
 
-def _extract_jobs_from_text(text: str, jobs: List[Dict]) -> None:
-    """Extract job objects from RSC text payload."""
+def _extract_individual_jobs(text: str, jobs: List[Dict]) -> None:
+    """Fallback: extract individual job objects from a malformed array string."""
     seen_ids: Set[str] = {j.get("id", "") for j in jobs}
-
-    # Look for JSON objects that look like job listings.
-    # Dice RSC payloads contain job data as serialised JSON within the push strings.
-    # Common patterns: objects with "id", "title", "companyName", "jobLocation"
-
-    # Try to find JSON arrays or objects containing job data
-    # Pattern: find substrings that look like JSON arrays of job objects
-    json_candidates = re.findall(
-        r'\{[^{}]*"id"\s*:\s*"[^"]+?"[^{}]*"title"\s*:\s*"[^"]+?"[^{}]*\}',
-        text,
-    )
-
-    for candidate in json_candidates:
+    # Find individual JSON objects that look like job listings
+    obj_pattern = re.compile(r'\{[^{}]*"guid"\s*:\s*"[^"]+?"[^{}]*\}')
+    for m in obj_pattern.finditer(text):
         try:
-            obj = json.loads(candidate)
-            if _is_dice_job(obj) and obj.get("id", "") not in seen_ids:
-                jobs.append(obj)
-                seen_ids.add(obj.get("id", ""))
-        except (json.JSONDecodeError, KeyError):
-            continue
-
-    # Also look for the full jobList.data array pattern
-    # Dice sometimes embeds: {"data":[{...job...},{...job...}]}
-    data_arrays = re.findall(r'"data"\s*:\s*\[(\[\{.*?\}\])\]', text, re.DOTALL)
-    for arr_str in data_arrays:
-        try:
-            arr = json.loads(arr_str)
-            for obj in arr:
-                if isinstance(obj, dict) and _is_dice_job(obj):
-                    jid = obj.get("id", obj.get("guid", ""))
-                    if jid and jid not in seen_ids:
-                        jobs.append(obj)
-                        seen_ids.add(jid)
-        except (json.JSONDecodeError, KeyError):
-            continue
-
-    # Broader search: find escaped JSON strings inside push payloads
-    # RSC payloads often double-escape JSON: "{\\"id\\":\\"abc\\",...}"
-    escaped_json_strs = re.findall(r'"(\{(?:\\"|[^"])*\})"', text)
-    for ej in escaped_json_strs:
-        try:
-            unescaped = ej.encode().decode('unicode_escape')
-            obj = json.loads(unescaped)
-            if isinstance(obj, dict) and _is_dice_job(obj):
-                jid = obj.get("id", obj.get("guid", ""))
-                if jid and jid not in seen_ids:
-                    jobs.append(obj)
-                    seen_ids.add(jid)
-        except (json.JSONDecodeError, UnicodeDecodeError, KeyError):
-            continue
-
-
-def _extract_jobs_from_json_ld(html: str, jobs: List[Dict]) -> None:
-    """Fallback: extract from JSON-LD structured data."""
-    seen_ids: Set[str] = {j.get("id", "") for j in jobs}
-    ld_pattern = re.compile(
-        r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>', re.DOTALL
-    )
-    for m in ld_pattern.finditer(html):
-        try:
-            data = json.loads(m.group(1))
-            items = []
-            if isinstance(data, list):
-                items = data
-            elif isinstance(data, dict):
-                items = data.get("itemListElement", [data])
-
-            for item in items:
-                if isinstance(item, dict):
-                    obj = item.get("item", item)
-                    if obj.get("@type") == "JobPosting" or "title" in obj:
-                        jid = obj.get("identifier", {}).get("value", "") if isinstance(obj.get("identifier"), dict) else str(obj.get("identifier", ""))
-                        if not jid:
-                            jid = hashlib.sha1(obj.get("title", "").encode()).hexdigest()[:12]
-                        if jid not in seen_ids:
-                            jobs.append(_normalise_jsonld_job(obj))
-                            seen_ids.add(jid)
-        except (json.JSONDecodeError, KeyError):
-            continue
-
-
-def _extract_jobs_from_next_data(html: str, jobs: List[Dict]) -> None:
-    """Fallback: extract from __NEXT_DATA__ script tag."""
-    seen_ids: Set[str] = {j.get("id", "") for j in jobs}
-    m = re.search(
-        r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL
-    )
-    if not m:
-        return
-    try:
-        data = json.loads(m.group(1))
-        # Walk the structure looking for job arrays
-        _walk_for_jobs(data, jobs, seen_ids)
-    except (json.JSONDecodeError, KeyError):
-        pass
-
-
-def _walk_for_jobs(obj, jobs: List[Dict], seen_ids: Set[str], depth: int = 0) -> None:
-    """Recursively walk a JSON structure looking for job-like objects."""
-    if depth > 15:
-        return
-    if isinstance(obj, dict):
-        if _is_dice_job(obj):
+            obj = json.loads(m.group(0))
             jid = obj.get("id", obj.get("guid", ""))
-            if jid and jid not in seen_ids:
+            if jid and jid not in seen_ids and obj.get("companyName"):
                 jobs.append(obj)
                 seen_ids.add(jid)
-        else:
-            for v in obj.values():
-                _walk_for_jobs(v, jobs, seen_ids, depth + 1)
-    elif isinstance(obj, list):
-        for item in obj:
-            _walk_for_jobs(item, jobs, seen_ids, depth + 1)
-
-
-def _is_dice_job(obj: dict) -> bool:
-    """Check if a dict looks like a Dice job listing."""
-    # Must have at least title and either companyName or company
-    has_title = bool(obj.get("title"))
-    has_company = bool(obj.get("companyName") or obj.get("company"))
-    has_id = bool(obj.get("id") or obj.get("guid"))
-    return has_title and has_company and has_id
-
-
-def _normalise_jsonld_job(obj: dict) -> dict:
-    """Convert a JSON-LD JobPosting to Dice-like format."""
-    location = obj.get("jobLocation", {})
-    if isinstance(location, dict):
-        address = location.get("address", {})
-        if isinstance(address, dict):
-            loc_name = f"{address.get('addressLocality', '')}, {address.get('addressRegion', '')}".strip(", ")
-        else:
-            loc_name = str(address)
-    else:
-        loc_name = str(location)
-
-    salary = ""
-    base_salary = obj.get("baseSalary", {})
-    if isinstance(base_salary, dict):
-        value = base_salary.get("value", {})
-        if isinstance(value, dict):
-            min_val = value.get("minValue", "")
-            max_val = value.get("maxValue", "")
-            currency = base_salary.get("currency", "USD")
-            if min_val and max_val:
-                salary = f"{currency} {min_val:,} - {max_val:,}" if isinstance(min_val, (int, float)) else f"{currency} {min_val} - {max_val}"
-            elif min_val:
-                salary = f"{currency} {min_val}"
-
-    identifier = obj.get("identifier", {})
-    jid = identifier.get("value", "") if isinstance(identifier, dict) else str(identifier)
-    if not jid:
-        jid = hashlib.sha1(obj.get("title", "").encode()).hexdigest()[:12]
-
-    return {
-        "id": jid,
-        "guid": jid,
-        "title": obj.get("title", ""),
-        "companyName": obj.get("hiringOrganization", {}).get("name", "") if isinstance(obj.get("hiringOrganization"), dict) else str(obj.get("hiringOrganization", "")),
-        "jobLocation": {"displayName": loc_name},
-        "salary": salary,
-        "employmentType": obj.get("employmentType", ""),
-        "postedDate": obj.get("datePosted", ""),
-        "detailsPageUrl": obj.get("url", ""),
-        "isRemote": "remote" in loc_name.lower(),
-        "summary": obj.get("description", "")[:200] if obj.get("description") else "",
-    }
+        except json.JSONDecodeError:
+            continue
 
 
 # ── Dice Scraper ───────────────────────────────────────────────────────────
@@ -732,10 +597,13 @@ class DiceScraper(AbstractJobScraper):
             except (ValueError, TypeError):
                 posted_text = str(posted_raw)
 
-        # URL
-        url = raw.get("detailsPageUrl", "")
-        if not url and guid:
+        # URL — always use canonical job-detail URL via guid when available,
+        # because some detailsPageUrl values are apply-redirect links
+        url = ""
+        if guid:
             url = f"https://www.dice.com/job-detail/{guid}"
+        if not url:
+            url = raw.get("detailsPageUrl", "")
 
         # Salary — Dice often includes this
         salary = raw.get("salary", "")
