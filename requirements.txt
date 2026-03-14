@@ -1,0 +1,11 @@
+# Dice Job Monitor - Dependencies
+# Install with: pip install -r requirements.txt
+
+# Core dependencies
+requests>=2.31.0
+beautifulsoup4>=4.12.3
+python-dotenv>=1.0.1
+aiohttp>=3.9.0
+
+# Scheduling (used by health_monitor / alerting)
+schedule>=1.2.1

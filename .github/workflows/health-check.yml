@@ -1,0 +1,87 @@
+name: Dice Health Check & Monitoring
+
+on:
+  # Run health check every hour
+  schedule:
+    - cron: '0 * * * *'
+
+  # Allow manual trigger
+  workflow_dispatch:
+
+  # Run after main monitor workflow completes
+  workflow_run:
+    workflows: ["Dice Job Monitor"]
+    types:
+      - completed
+
+jobs:
+  health-check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Restore metrics cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            metrics.json
+            seen_jobs.json
+          key: dice-monitor-state-${{ github.run_id }}
+          restore-keys: |
+            dice-monitor-state-
+
+      - name: Run health monitor
+        env:
+          # Alert configuration
+          ALERT_MIN_SUCCESS_RATE: ${{ secrets.ALERT_MIN_SUCCESS_RATE || '50.0' }}
+          ALERT_MAX_FAILURES: ${{ secrets.ALERT_MAX_FAILURES || '5' }}
+          ALERT_HOURS_NO_JOBS: ${{ secrets.ALERT_HOURS_NO_JOBS || '24' }}
+          ALERT_HOURS_NO_RUNS: ${{ secrets.ALERT_HOURS_NO_RUNS || '2' }}
+
+          # Discord alerts (reuse main webhook)
+          DISCORD_ENABLED: ${{ secrets.DISCORD_ENABLED || 'true' }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_ALERT_ROLE_ID: ${{ secrets.DISCORD_ALERT_ROLE_ID }}
+
+          # Email alerts (optional)
+          EMAIL_ALERT_ENABLED: ${{ secrets.EMAIL_ALERT_ENABLED || 'false' }}
+          SMTP_SERVER: ${{ secrets.SMTP_SERVER || 'smtp.gmail.com' }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT || '587' }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+          ALERT_EMAIL_FROM: ${{ secrets.ALERT_EMAIL_FROM }}
+
+          # GitHub Actions monitoring
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+          # Metrics file location
+          METRICS_FILE: metrics.json
+          SEEN_JOBS_FILE: seen_jobs.json
+        run: |
+          echo "Running health monitor..."
+          python health_monitor.py --check-github
+
+      - name: Upload health check logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dice-health-check-logs-${{ github.run_number }}
+          path: |
+            health_monitor.log
+            metrics.json
+          retention-days: 7
