@@ -196,7 +196,7 @@ async def run_once() -> None:
 
         # ── 6. Display and notify ────────────────────────────────────
         if new_jobs:
-            new_jobs.sort(key=parse_posted_time, reverse=True)
+            new_jobs.sort(key=parse_posted_time)
             log("-" * 60)
             for i, job in enumerate(new_jobs, 1):
                 salary_info = f" | {job['salary']}" if job.get('salary') else ""
