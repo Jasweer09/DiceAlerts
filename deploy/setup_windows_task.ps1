@@ -12,10 +12,11 @@ if ($existing) {
     Write-Host "[OK] Removed existing task"
 }
 
-# Create action
+# Create action — use wscript + VBS wrapper to run without visible window
+$vbsPath = Join-Path $PSScriptRoot "..\run_hidden.vbs"
 $action = New-ScheduledTaskAction `
-    -Execute "cmd.exe" `
-    -Argument "/c `"$batPath`"" `
+    -Execute "wscript.exe" `
+    -Argument "`"$vbsPath`"" `
     -WorkingDirectory $workDir
 
 # Create trigger: repeat every 5 minutes indefinitely
