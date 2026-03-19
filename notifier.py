@@ -7,8 +7,9 @@ Follows Single Responsibility -- only handles notification delivery.
 
 Features:
 - Async Discord webhook delivery via aiohttp
+- Batch sending: up to 10 embeds per webhook call (Discord max)
 - Rate-limit awareness with Retry-After header support
-- Up to 3 retries per notification with exponential backoff
+- Up to 3 retries per batch with exponential backoff
 - Retries on transient 5xx errors (not just 429)
 - Returns failed jobs so they can retry next cycle
 - Rich embedded messages with job details
@@ -23,12 +24,15 @@ import aiohttp
 
 logger = logging.getLogger(__name__)
 
+BATCH_SIZE = 10  # Discord allows max 10 embeds per webhook call
+
 
 # ── Discord Notifications ────────────────────────────────────────────────────
 
 async def send_discord(jobs: List[Dict], config) -> Tuple[int, List[Dict]]:
     """Send job alerts to Discord via webhook with rich embeds.
 
+    Sends up to 10 embeds per webhook call to minimize API calls.
     Returns (sent_count, list_of_failed_jobs) so caller can retry failures.
     """
     if not config.DISCORD_ENABLED or not config.DISCORD_WEBHOOK_URL:
@@ -38,34 +42,44 @@ async def send_discord(jobs: List[Dict], config) -> Tuple[int, List[Dict]]:
     failed_jobs: List[Dict] = []
     timeout = aiohttp.ClientTimeout(total=15)
 
+    # Build all embeds first
+    job_embeds = []
+    for job in jobs:
+        fields = [
+            {"name": "\U0001f3e2 Company", "value": job["company"], "inline": True},
+            {"name": "\U0001f4cd Location", "value": job["location"], "inline": True},
+            {"name": "\U0001f550 Posted", "value": job["posted_text"], "inline": True},
+        ]
+
+        # Add salary field if available (Dice provides salary data)
+        salary = job.get("salary", "")
+        if salary:
+            fields.append({"name": "\U0001f4b0 Salary", "value": salary, "inline": True})
+
+        embed = {
+            "title": f"\U0001f514 {job['title']}",
+            "url": job["url"],
+            "color": 0xCC0000,  # Dice red
+            "fields": fields,
+            "footer": {"text": "Dice Job Monitor"},
+        }
+        job_embeds.append((job, embed))
+
+    # Send in batches of BATCH_SIZE
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        for job in jobs:
-            fields = [
-                {"name": "\U0001f3e2 Company", "value": job["company"], "inline": True},
-                {"name": "\U0001f4cd Location", "value": job["location"], "inline": True},
-                {"name": "\U0001f550 Posted", "value": job["posted_text"], "inline": True},
-            ]
-
-            # Add salary field if available (Dice provides salary data)
-            salary = job.get("salary", "")
-            if salary:
-                fields.append({"name": "\U0001f4b0 Salary", "value": salary, "inline": True})
-
-            embed = {
-                "title": f"\U0001f514 {job['title']}",
-                "url": job["url"],
-                "color": 0xCC0000,  # Dice red
-                "fields": fields,
-                "footer": {"text": "Dice Job Monitor"},
-            }
-            payload = {"embeds": [embed]}
+        for batch_start in range(0, len(job_embeds), BATCH_SIZE):
+            batch = job_embeds[batch_start:batch_start + BATCH_SIZE]
+            embeds = [embed for _, embed in batch]
+            batch_jobs = [job for job, _ in batch]
+            payload = {"embeds": embeds}
 
             success = False
             for attempt in range(3):
                 try:
                     async with session.post(config.DISCORD_WEBHOOK_URL, json=payload) as resp:
                         if resp.status in (200, 204):
-                            print(f"  [DISCORD] Sent: {job['title']} @ {job['company']}")
+                            for job in batch_jobs:
+                                print(f"  [DISCORD] Sent: {job['title']} @ {job['company']}")
                             success = True
                             break
                         elif resp.status == 429:
@@ -88,11 +102,11 @@ async def send_discord(jobs: List[Dict], config) -> Tuple[int, List[Dict]]:
                         await asyncio.sleep(1.0 * (attempt + 1))
 
             if success:
-                sent += 1
+                sent += len(batch_jobs)
             else:
-                failed_jobs.append(job)
+                failed_jobs.extend(batch_jobs)
 
-            # Small delay between messages to respect Discord rate limits
+            # Small delay between batches to respect Discord rate limits
             await asyncio.sleep(0.5)
 
     if failed_jobs:
