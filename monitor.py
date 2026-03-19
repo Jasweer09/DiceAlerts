@@ -15,11 +15,21 @@ Usage:
     python monitor.py --once       # Run once and exit (GitHub Actions)
 """
 
+import sys
+import os
 import asyncio
 import time
 import argparse
 from datetime import datetime, timezone
 from typing import List, Dict
+
+# Force UTF-8 stdout/stderr on Windows to prevent charmap encoding crashes
+if sys.platform == "win32":
+    os.environ["PYTHONUTF8"] = "1"
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 import config
 from scraper import DiceScraper, DiceSearchStrategy, CircuitBreakerSkip
